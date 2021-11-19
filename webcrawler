@@ -1,0 +1,2 @@
+#!/usr/bin/env bash
+./crawler/bin/python webcrawler.py $1 $2 $3
