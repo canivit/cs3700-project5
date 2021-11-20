@@ -66,7 +66,7 @@ class WebCrawler:
         return request
 
     def send_request(self, socket, request):
-        socket.send(request.encode())          
+        socket.send(request.encode())
         if self.verbose:
             print('Send Request:')
             print(request + '\n')
@@ -83,7 +83,9 @@ class WebCrawler:
                 response += chunk.decode()
         pair = response.split('\r\n\r\n')
         header = pair[0]
-        data = pair[1]
+        data = ''
+        if len(pair) > 1:
+            data = pair[1]
         if self.verbose:
             print('Receive Response:')
             print(header + '\r\n')
@@ -147,13 +149,13 @@ class WebCrawler:
     def search_paths(self, data):
         soup = bs(data, 'html.parser')
         for link in soup.find_all('a', href=True):
-            url = urlparse(link['href'])                
+            url = urlparse(link['href'])
             host = url.hostname
             path = url.path
             host_valid = False
             if host == None or host == self.host:
                 host_valid = True
-            if path not in self.visited.keys() and host_valid:
+            if path not in self.visited and host_valid:
                 self.queue.append(path)
 
     def search_flags(self, path, data):
@@ -180,7 +182,7 @@ class WebCrawler:
             return
         elif code == 200:
             self.visited[current_path] = True
-            self.search_paths(data)            
+            self.search_paths(data)
             self.queue.pop(0)
             self.search_flags(current_path, data)
         else:
