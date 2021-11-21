@@ -1,6 +1,9 @@
 import argparse
+import gzip
+from os import sysconf
 import socket
 import ssl
+import sys
 from urllib.parse import urlparse
 from bs4 import BeautifulSoup as bs
 
@@ -19,18 +22,26 @@ class WebCrawler:
     csrftoken = ''
     sessionid = ''
     flags = []
+    socket = None
+    time_out = 0.5
 
     def __init__(self, username, password, verbose):
         self.username = username
         self.password = password
         self.verbose = verbose
+        self.socket = self.create_socket()
 
     def create_socket(self):
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.connect((self.host, self.port))
-        context = ssl.create_default_context()
-        sscok = context.wrap_socket(sock, server_hostname=self.host)
-        return sscok
+        while True:
+            try:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.settimeout(self.time_out)
+                sock.connect((self.host, self.port))
+                context = ssl.create_default_context()
+                ssock = context.wrap_socket(sock, server_hostname=self.host)
+                return ssock
+            except socket.timeout:
+                continue
 
     def create_get_request(self, path):
         request = 'GET %s HTTP/1.1\r\n' % path
@@ -45,7 +56,7 @@ class WebCrawler:
                 self.csrftoken, self.sessionid)
         elif self.csrftoken != '' and self.sessionid == '':
             request += 'Cookie: csrftoken=%s\r\n' % self.csrftoken
-        request += 'Connection: close\r\n\r\n'
+        request += 'Connection: keep-alive\r\n\r\n'
         return request
 
     def create_post_request(self, middleware):
@@ -55,7 +66,7 @@ class WebCrawler:
         request += 'Accept: text/html\r\n'
         #request += 'Accept-Encoding: gzip\r\n'
         request += 'Accept-Language: en-US\r\n'
-        request += 'Connection: close\r\n'
+        request += 'Connection: keep-alive\r\n'
         request += 'Cookie: csrftoken=%s\r\n' % self.csrftoken
         payload = 'username=%s&password=%s&csrfmiddlewaretoken=%s&next=/fakebook/' % (
             self.username, self.password, middleware)
@@ -65,22 +76,32 @@ class WebCrawler:
         request += payload
         return request
 
-    def send_request(self, socket, request):
-        socket.send(request.encode())
+    def send_request(self, request):
+        self.socket.send(request.encode())
         if self.verbose:
             print('Send Request:')
             print(request + '\n')
 
-    def recv_response(self, socket):
-        chunks = []
-        complete = False
+    def recv_response(self, request):
         response = ''
+        complete = False
         while not complete:
-            chunk = socket.recv(65535)
-            if len(chunk) == 0:
+            response = ''
+            chunk = None
+            try:
+                chunk = self.socket.recv(65535)
+                response = chunk.decode()
                 complete = True
-            else:
-                response += chunk.decode()
+            except socket.timeout:
+                self.socket.close()
+                self.socket = self.create_socket()
+                complete = False
+                self.send_request(request)
+            if len(response) == 0:
+                self.socket.close()
+                self.socket = self.create_socket()
+                complete = False
+                self.send_request(request)
         pair = response.split('\r\n\r\n')
         header = pair[0]
         data = ''
@@ -111,26 +132,20 @@ class WebCrawler:
         return token
 
     def login(self):
-        socket = self.create_socket()
         request = self.create_get_request(self.start)
-        self.send_request(socket, request)
-        header, data = self.recv_response(socket)
-        socket.close()
+        self.send_request(request)
+        header, data = self.recv_response(request)
         self.update_cookie(header)
 
-        socket = self.create_socket()
         middleware = self.extract_middleware(data)
         request = self.create_post_request(middleware)
-        self.send_request(socket, request)
-        header, data = self.recv_response(socket)
-        socket.close()
+        self.send_request(request)
+        header, data = self.recv_response(request)
         self.update_cookie(header)
 
-        socket = self.create_socket()
         request = self.create_get_request('/fakebook/')
-        self.send_request(socket, request)
-        header, data = self.recv_response(socket)
-        socket.close()
+        self.send_request(request)
+        header, data = self.recv_response(request)
         self.update_cookie(header)
 
         self.queue.append('/fakebook/')
@@ -152,13 +167,10 @@ class WebCrawler:
             url = urlparse(link['href'])
             host = url.hostname
             path = url.path
-            host_valid = False
-            if host == None or host == self.host:
-                host_valid = True
-            if path not in self.visited and host_valid:
+            if '/fakebook/' in path and path not in self.visited:
                 self.queue.append(path)
 
-    def search_flags(self, path, data):
+    def search_flags(self, data):
         soup = bs(data, 'html.parser')
         for tag in soup.find_all('h2', class_='secret_flag'):
             flag_string = tag.string
@@ -167,7 +179,14 @@ class WebCrawler:
                 self.flags.append(flag)
                 print(flag)
 
+    def check_connection(self, header):
+        for line in header.split('\r\n'):
+            if 'Connection: close' in line:
+                self.socket.close()
+                self.socket = self.create_socket()
+
     def handle_response(self, current_path, header, data):
+        self.check_connection(header)
         code = self.get_header_code(header)
         if code == 302:
             self.visited[current_path] = True
@@ -175,16 +194,13 @@ class WebCrawler:
             next_path = urlparse(location).path
             self.queue.append(next_path)
             self.queue.pop(0)
-        elif code == 403:
-            self.visited[current_path] = True
-            self.queue.pop(0)
         elif code == 500:
             return
         elif code == 200:
             self.visited[current_path] = True
+            self.search_flags(data)
             self.search_paths(data)
             self.queue.pop(0)
-            self.search_flags(current_path, data)
         else:
             self.visited[current_path] = True
             self.queue.pop(0)
@@ -197,13 +213,13 @@ class WebCrawler:
                 self.visited[path] = True
                 self.queue.pop(0)
                 continue
-            socket = self.create_socket()
             request = self.create_get_request(path)
-            self.send_request(socket, request)
-            header, data = self.recv_response(socket)
-            socket.close()
+            self.send_request(request)
+            header, data = self.recv_response(request)
             self.update_cookie(header)
             self.handle_response(path, header, data)
+            if self.verbose:
+                print('FLAGS: %d\n' % len(self.flags))
 
 
 desc = 'Can Ivit\'s Webcrawler for Fakebook'
